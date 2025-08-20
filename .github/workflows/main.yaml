@@ -1,0 +1,295 @@
+name: "Terraform action"
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - 'terraform/**'
+  #pull_request:
+  workflow_dispatch:
+
+permissions:
+      id-token: write # This is required for aws oidc connection
+      contents: read # This is required for actions/checkout
+      pull-requests: write # This is required for gh bot to comment PR
+      issues: write
+
+env:
+  TF_LOG: INFO
+  AWS_REGION:  ${{ vars.AWS_REGION }}
+  AWS_ROLE:  ${{ vars.AWS_ROLE }}
+  BUCKET_NAME: ${{ vars.BUCKET_NAME }}
+  PROJECT: ${{ vars.PROJECT }}
+  REPO: ${{ vars.REPO }}
+  ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
+  TOKEN: ${{ secrets.GH_PAT }}
+
+jobs:
+
+  setup-environment:
+    environment: dev
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    outputs:                         # Definir las salidas del job
+      AWS_ACCOUNT_ID: ${{ steps.aws-account-id.outputs.AWS_ACCOUNT_ID }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4.1.7
+    
+    - name: Configure AWS credentials from AWS account
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE }}
+        aws-region: ${{ vars.AWS_REGION }}
+        role-session-name: GitHub-OIDC-TERRAFORM
+    
+    - name: Get AWS Account ID
+      id: aws-account-id
+      run: |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "AWS_ACCOUNT_ID=${ACCOUNT_ID}" >> $GITHUB_ENV
+        ##echo "::set-output name=AWS_ACCOUNT_ID::${ACCOUNT_ID}"
+        echo "AWS_ACCOUNT_ID=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+    
+    - name: Clone Repo Publico
+      run: git clone https://github.com/homecu/${{ vars.REPO }}.git ${{ vars.REPO }}
+      working-directory: terraform
+
+    - name: Upload cloned repositorie as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cloned-repos
+        path: |
+          ./terraform/${{ vars.REPO }}
+  
+  build-and-push-docker-images:
+    environment: dev
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCOUNT_ID: ${{ needs.setup-environment.outputs.AWS_ACCOUNT_ID }}
+    needs: setup-environment
+
+    steps:
+    - name: Download cloned repositories
+      uses: actions/download-artifact@v4
+      with:
+        name: cloned-repos
+        path: ${{ github.workspace }}/terraform
+        merge-multiple: false
+
+    - name: Build Docker image for app1
+      run: |
+        docker build -t ${{ env.ECR_REPO_1 }}:latest ./${{ env.REPO }}/test-app
+        docker tag ${{ env.ECR_REPO_1 }}:latest ${{ env.ECR_REPO_NAME }}/${{ env.ECR_REPO_1 }}:latest
+      working-directory: terraform
+
+    - name: Build Docker image for app2
+      run: |
+        docker build -t ${{ env.ECR_REPO_2 }}:latest ./${{ env.REPO }}/test-api
+        docker tag ${{ env.ECR_REPO_2 }}:latest ${{ env.ECR_REPO_NAME }}/${{ env.ECR_REPO_2 }}:latest
+      working-directory: terraform
+  
+    - name: Configure AWS credentials from AWS account
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE }}
+        aws-region: ${{ vars.AWS_REGION }}
+        role-session-name: GitHub-OIDC-TERRAFORM
+
+    - name: Login to ECR
+      run: |
+        aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REPO_NAME }}.amazonaws.com
+
+    - name: Ensure ECR repository exists
+      run: |
+        aws ecr-public describe-repositories --repository-names ${{ env.ECR_REPO_1 }} --region ${{ env.AWS_REGION }} || 
+        aws ecr-public create-repository --repository-name ${{ env.ECR_REPO_1 }} --region ${{ env.AWS_REGION }}
+        
+        aws ecr-public describe-repositories --repository-names ${{ env.ECR_REPO_2 }} --region ${{ env.AWS_REGION }} || 
+        aws ecr-public create-repository --repository-name ${{ env.ECR_REPO_2 }} --region ${{ env.AWS_REGION }}
+
+    - name: Push app1 Docker image
+      run: |
+        docker push ${{ env.ECR_REPO_NAME }}/${{ env.ECR_REPO_1 }}:latest
+
+    - name: Push app2 Docker image
+      run: |
+        docker push ${{ env.ECR_REPO_NAME }}/${{ env.ECR_REPO_2 }}:latest
+  
+  terraform-plan:
+    environment: dev
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: build-and-push-docker-images
+    outputs:
+      approved: ${{ steps.approval.outputs.approved }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4.1.7
+    
+    - name: Configure AWS credentials from AWS account
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE }}
+        aws-region: ${{ vars.AWS_REGION }}
+        role-session-name: GitHub-OIDC-TERRAFORM
+
+    - name: Determine .tfvars file and assign environment
+      id: tfvars
+      run: |
+        if [[ "${GITHUB_REF##*/}" == "main" ]]; then
+          echo "TFVARS_FILE=envs/prod/terraform.tfvars" >> $GITHUB_ENV
+          echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+        elif [[ "${GITHUB_REF##*/}" == "dev" ]]; then
+          echo "TFVARS_FILE=envs/dev/terraform.tfvars" >> $GITHUB_ENV
+          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+        else
+          echo "TFVARS_FILE=envs/qa/terraform.tfvars" >> $GITHUB_ENV
+          echo "ENVIRONMENT=qa" >> $GITHUB_ENV
+        fi
+      working-directory: terraform
+
+    - name: Determinate var backend file
+      id: var-backend
+      run: |
+        cat <<EOF >  "envs/${{env.ENVIRONMENT}}/generated_backend.tfvars"
+        bucket         = "${{ vars.BUCKET_NAME }}"
+        key            = "${{ env.ENVIRONMENT }}/terraform.tfstate"
+        region         = "${{ vars.AWS_REGION }}"
+        encrypt        = "true"
+        EOF
+        ls -la
+      working-directory: terraform
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.2.5
+
+    - name: Terraform Init
+      id: init
+      run: | 
+        cd envs/${{env.ENVIRONMENT}}
+        terraform init -reconfigure -backend-config=generated_backend.tfvars
+      working-directory: terraform
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate -no-color
+      working-directory: terraform
+ 
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd envs/${{env.ENVIRONMENT}}
+        terraform plan -var-file=${{ env.TFVARS_FILE }} -out=tfplan -no-color
+      working-directory: terraform
+      continue-on-error: true
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: my-artifacts
+        path: |
+          ./terraform/envs/${{env.ENVIRONMENT}}/tfplan
+          ./terraform/envs/${{env.ENVIRONMENT}}/generated_backend.tfvars
+  
+    - name: Approval-Action
+      id: approval
+      uses: ekeel/approval-action@v1.0.3
+      with:
+        token: ${{ secrets.GH_PAT }}
+        approvers: 'pulidovpe'
+        minimumApprovals: '1'
+        issueLabels: 'ManualApproval,ApprovalAction'
+        excludeInitiator: 'false'
+        approveWords: 'approved, aprobado'
+        rejectWords: 'denied, rechazado'
+        waitInterval: '1'
+        waitTimeout: '3'
+        issueTitle: 'Deployment request approval'
+        issueBody: |
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+
+          <details><summary>Validation Output</summary>
+
+          \`\`\`
+          ${{ steps.validate.outputs.stdout }}
+          \`\`\`
+
+          </details>
+
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+          <details><summary>Show Plan</summary>
+
+          \`\`\`
+          ${{ steps.plan.outputs.stdout }}
+          \`\`\`
+
+          </details>
+
+          *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+  terraform-apply:
+    environment: dev
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: dev
+    needs: terraform-plan
+    if: needs.terraform-plan.outputs.approved == 'true'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4.1.7
+    
+    - name: Configure AWS credentials from AWS account
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE }}
+        aws-region: ${{ vars.AWS_REGION }}
+        role-session-name: GitHub-OIDC-TERRAFORM
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.2.5
+    
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: my-artifacts
+        path: ${{ github.workspace }}/terraform/envs/${{env.ENVIRONMENT}}
+        merge-multiple: false
+    
+    - name: Verify files before upload
+      run: |
+        ls -la ${{ github.workspace }}/terraform/
+        cat ${{ github.workspace }}/terraform/envs/${{env.ENVIRONMENT}}/generated_backend.tfvars
+    
+    - name: Terraform Init
+      id: init
+      run: |
+        cd envs/${{env.ENVIRONMENT}}
+        terraform init -reconfigure -backend-config=envs/${{env.ENVIRONMENT}}/generated_backend.tfvars
+      working-directory: terraform
+
+    - name: Terraform Apply
+      run: |
+        cd envs/${{env.ENVIRONMENT}}
+        terraform apply -auto-approve tfplan
+      working-directory: terraform
