@@ -19,7 +19,7 @@ permissions:
 env:
   TF_LOG: INFO
   AWS_REGION:  ${{ vars.AWS_REGION }}
-  AWS_ROLE:  ${{ vars.AWS_ROLE }}
+  AWS_ROLE:  ${{ secrets.AWS_ROLE }}
   BUCKET_NAME: ${{ vars.BUCKET_NAME }}
   PROJECT: ${{ vars.PROJECT }}
   REPO: ${{ vars.REPO }}
@@ -42,7 +42,7 @@ jobs:
     - name: Configure AWS credentials from AWS account
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        role-to-assume: ${{ vars.AWS_ROLE }}
+        role-to-assume: ${{ secrets.AWS_ROLE }}
         aws-region: ${{ vars.AWS_REGION }}
         role-session-name: GitHub-OIDC-TERRAFORM
     
@@ -143,12 +143,18 @@ jobs:
       id: tfvars
       run: |
         if [[ "${GITHUB_REF##*/}" == "main" ]]; then
+          NEW_ACCOUNT_ID="aws_account_id = \"${ACCOUNT_ID}\""
+          sed -i '' "\$s/.*/$NEW_ACCOUNT_ID/" envs/prod/terraform.tfvars
           echo "TFVARS_FILE=envs/prod/terraform.tfvars" >> $GITHUB_ENV
           echo "ENVIRONMENT=prod" >> $GITHUB_ENV
         elif [[ "${GITHUB_REF##*/}" == "dev" ]]; then
+          NEW_ACCOUNT_ID="aws_account_id = \"${ACCOUNT_ID}\""
+          sed -i '' "\$s/.*/$NEW_ACCOUNT_ID/" envs/prod/terraform.tfvars
           echo "TFVARS_FILE=envs/dev/terraform.tfvars" >> $GITHUB_ENV
           echo "ENVIRONMENT=dev" >> $GITHUB_ENV
         else
+          NEW_ACCOUNT_ID="aws_account_id = \"${ACCOUNT_ID}\""
+          sed -i '' "\$s/.*/$NEW_ACCOUNT_ID/" envs/prod/terraform.tfvars
           echo "TFVARS_FILE=envs/qa/terraform.tfvars" >> $GITHUB_ENV
           echo "ENVIRONMENT=qa" >> $GITHUB_ENV
         fi
